@@ -1,15 +1,18 @@
-CMakeFiles/
-CMakeCache.txt
-compile_commands.json
-Makefile
+build/
+cmake-build-debug/
+cmake-build-release/
+cmake-build-*/
 
-*.o
-*.out
-*.a
-*.so
-*.exe
+**/*.pb.cc
+**/*.pb.h
+**/*.grpc.pb.cc
+**/*.grpc.pb.h
+
+.idea/
+*.iml
 
 .DS_Store
 
-.idea/
-.vscode/
+*.o
+*.a
+*.out
