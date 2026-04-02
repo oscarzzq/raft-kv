@@ -4,6 +4,7 @@
 #include <chrono>
 #include <algorithm>
 #include <grpcpp/grpcpp.h>
+#include <sstream>
 
 using namespace std::chrono_literals;
 
@@ -37,12 +38,13 @@ void RaftNode::start() {
     std::string address = peer_addresses_[id_];
     grpc::ServerBuilder builder;
     builder.AddListeningPort(address, grpc::InsecureServerCredentials());
-    builder.RegisterService(this);
+    builder.RegisterService(static_cast<raft::RaftService::Service*>(this));
+    builder.RegisterService(static_cast<raft::KVService::Service*>(this));
     grpc_server_ = builder.BuildAndStart();
     std::cout << "Node " << id_ << " listening on " << address << "\n";
 
     election_thread_  = std::thread(&RaftNode::runElectionTimer, this);
-    heartbeat_thread_ = std::thread(&RaftNode::runHeartbeat,     this);
+    heartbeat_thread_ = std::thread(&RaftNode::runHeartbeat, this);
 
     grpc_server_->Wait();
 }
@@ -136,8 +138,24 @@ void RaftNode::applyEntries() {
     while (last_applied_ < commit_index_) {
         last_applied_++;
         auto& entry = log_[last_applied_];
-        std::cout << "Node " << id_ << " applying [" << last_applied_
-                  << "]: " << entry.command << "\n";
+        applyToStateMachine(entry.command);
+    }
+}
+
+void RaftNode::applyToStateMachine(const std::string& command) {
+    if (command.empty()) return;
+
+    std::istringstream ss(command);
+    std::string op, key, value;
+    ss >> op >> key;
+
+    if (op == "PUT") {
+        ss >> value;
+        kv_.put(key, value);
+        std::cout << "Node " << id_ << " applied PUT " << key << "=" << value << "\n";
+    } else if (op == "DEL") {
+        kv_.del(key);
+        std::cout << "Node " << id_ << " applied DEL " << key << "\n";
     }
 }
 
@@ -372,5 +390,58 @@ grpc::Status RaftNode::AppendEntries(
     }
 
     response->set_success(true);
+    return grpc::Status::OK;
+}
+
+grpc::Status RaftNode::Execute(
+    grpc::ServerContext* context,
+    const raft::KVRequest* request,
+    raft::KVResponse* response)
+{
+    const std::string& op  = request->op();
+    const std::string& key = request->key();
+
+    if (op == "GET") {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto val = kv_.get(key);
+        if (val) {
+            response->set_success(true);
+            response->set_value(*val);
+        } else {
+            response->set_success(false);
+            response->set_error("key not found");
+        }
+        return grpc::Status::OK;
+    }
+
+    std::string command = op + " " + key;
+    if (op == "PUT") command += " " + request->value();
+
+    std::unique_lock<std::mutex> lock(mu_);
+
+    if (state_ != NodeState::LEADER) {
+        response->set_success(false);
+        response->set_not_leader(true);
+        response->set_error("not leader");
+        response->set_leader_id(leader_id_);
+        return grpc::Status::OK;
+    }
+
+    LogEntry entry{current_term_, command};
+    log_.push_back(entry);
+    int index = lastLogIndex();
+    match_index_[id_] = index;
+
+    commit_cv_.wait_for(lock, std::chrono::milliseconds(2000), [this, index] {
+        return commit_index_ >= index || state_ != NodeState::LEADER;
+    });
+
+    if (commit_index_ >= index) {
+        response->set_success(true);
+    } else {
+        response->set_success(false);
+        response->set_error("commit timeout or leader changed");
+    }
+
     return grpc::Status::OK;
 }

@@ -50,6 +50,7 @@ target_link_libraries(proto_lib PUBLIC gRPC::grpc++ protobuf::libprotobuf)
 add_executable(raft_server
         src/server/main.cpp
         src/server/RaftNode.cpp
+        src/server/KVStore.h
 )
 target_include_directories(raft_server PRIVATE ${PROTO_OUT} src/server)
 target_link_libraries(raft_server PRIVATE proto_lib gRPC::grpc++)
@@ -58,5 +59,5 @@ target_link_libraries(raft_server PRIVATE proto_lib gRPC::grpc++)
 add_executable(raft_client
         src/client/main.cpp
 )
-target_include_directories(raft_client PRIVATE ${PROTO_OUT})
+target_include_directories(raft_client PRIVATE ${PROTO_OUT} src/server)
 target_link_libraries(raft_client PRIVATE proto_lib gRPC::grpc++)

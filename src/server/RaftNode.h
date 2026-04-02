@@ -8,6 +8,7 @@
 #include <memory>
 #include <grpcpp/grpcpp.h>
 #include "raft.grpc.pb.h"
+#include "KVStore.h"
 
 enum class NodeState { FOLLOWER, CANDIDATE, LEADER };
 
@@ -16,7 +17,9 @@ struct LogEntry {
     std::string command;
 };
 
-class RaftNode final : public raft::RaftService::Service {
+class RaftNode final
+    : public raft::RaftService::Service
+    , public raft::KVService::Service {
 public:
     RaftNode(int id, std::vector<std::string> peer_addresses);
     ~RaftNode();
@@ -34,6 +37,12 @@ public:
         grpc::ServerContext* context,
         const raft::AppendEntriesRequest* request,
         raft::AppendEntriesResponse* response
+    ) override;
+
+    grpc::Status Execute(
+        grpc::ServerContext* context,
+        const raft::KVRequest* request,
+        raft::KVResponse* response
     ) override;
 
 private:
@@ -63,6 +72,8 @@ private:
     std::thread heartbeat_thread_;
     std::unique_ptr<grpc::Server> grpc_server_;
 
+    KVStore kv_;
+
     void runElectionTimer();
     void startElection(std::unique_lock<std::mutex>& lock);
     void runHeartbeat();
@@ -70,6 +81,7 @@ private:
     void resetElectionTimer();
     void advanceCommitIndex();
     void applyEntries();
+    void applyToStateMachine(const std::string& command);
     void printLog();
 
     int  getRandomTimeout();
