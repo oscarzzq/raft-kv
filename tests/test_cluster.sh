@@ -57,10 +57,9 @@ assert_eq() {
 }
 
 wait_for_leader() {
-    # Dynamically poll for the leader rather than relying on a hardcoded sleep
     for _ in {1..10}; do
         if grep -q "becoming LEADER" /tmp/raft_node_*.log 2>/dev/null; then
-            sleep 0.5 # Give the new leader a fraction of a second to initialize
+            sleep 1.0
             return
         fi
         sleep 0.5

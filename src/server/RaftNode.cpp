@@ -92,11 +92,11 @@ void RaftNode::becomeLeader() {
     leader_id_ = id_;
 
     int n = (int)peer_addresses_.size();
-
     next_index_.assign(n, lastLogIndex() + 1);
-
     match_index_.assign(n, 0);
+    match_index_[id_] = lastLogIndex();
 
+    log_.push_back({current_term_, ""});
     match_index_[id_] = lastLogIndex();
 
     cv_.notify_all();
