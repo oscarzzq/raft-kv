@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(raft_kv)
+
+list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew")
+set(CMAKE_PREFIX_PATH "/opt/homebrew" ${CMAKE_PREFIX_PATH})
+
 set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0")
 
 set(CMAKE_CXX_STANDARD 17)

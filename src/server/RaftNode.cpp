@@ -1,18 +1,251 @@
-//
-// Created by Oscar Zhang on 2026/4/1.
-//
-
 #include "RaftNode.h"
 #include <iostream>
+#include <random>
+#include <chrono>
+#include <grpcpp/grpcpp.h>
+
+using namespace std::chrono_literals;
 
 RaftNode::RaftNode(int id, std::vector<std::string> peer_addresses)
     : id_(id)
     , state_(NodeState::FOLLOWER)
     , current_term_(0)
     , voted_for_(-1)
+    , leader_id_(-1)
+    , running_(true)
     , peer_addresses_(peer_addresses)
-{}
+{
+    for (const auto& addr : peer_addresses_) {
+        auto channel = grpc::CreateChannel(addr, grpc::InsecureChannelCredentials());
+        peer_stubs_.push_back(raft::RaftService::NewStub(channel));
+    }
+}
+
+RaftNode::~RaftNode() {
+    running_ = false;
+    cv_.notify_all();
+    if (election_thread_.joinable())  election_thread_.join();
+    if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
+    if (grpc_server_) grpc_server_->Shutdown();
+}
 
 void RaftNode::start() {
-    std::cout << "Node " << id_ << " starting as FOLLOWER\n";
+    std::string address = peer_addresses_[id_];
+    grpc::ServerBuilder builder;
+    builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+    builder.RegisterService(this);
+    grpc_server_ = builder.BuildAndStart();
+    std::cout << "Node " << id_ << " listening on " << address << "\n";
+
+    election_thread_ = std::thread(&RaftNode::runElectionTimer, this);
+    heartbeat_thread_ = std::thread(&RaftNode::runHeartbeat,     this);
+
+    grpc_server_->Wait();
+}
+
+int RaftNode::getRandomTimeout() {
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> dist(150, 300);
+    return dist(rng);
+}
+
+void RaftNode::resetElectionTimer() {
+    heartbeat_received_ = true;
+    cv_.notify_all();
+}
+
+void RaftNode::becomeFollower(int term) {
+    std::cout << "Node " << id_ << " becoming FOLLOWER (term " << term << ")\n";
+    state_ = NodeState::FOLLOWER;
+    current_term_ = term;
+    voted_for_ = -1;
+    leader_id_ = -1;
+}
+
+void RaftNode::becomeLeader() {
+    std::cout << "Node " << id_ << " becoming LEADER (term " << current_term_ << ")\n";
+    state_ = NodeState::LEADER;
+    leader_id_ = id_;
+    cv_.notify_all();
+}
+
+bool RaftNode::isMoreUpToDate(int last_log_index, int last_log_term) {
+    (void)last_log_index;
+    (void)last_log_term;
+    return true;
+}
+
+void RaftNode::runElectionTimer() {
+    while (running_) {
+        std::unique_lock<std::mutex> lock(mu_);
+
+        heartbeat_received_ = false;
+        int timeout_ms = getRandomTimeout();
+
+        cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] {
+            return !running_ || state_ == NodeState::LEADER || heartbeat_received_;
+        });
+
+        if (!running_) break;
+
+        if (state_ == NodeState::LEADER || heartbeat_received_) continue;
+
+        startElection(lock);
+    }
+}
+
+void RaftNode::startElection(std::unique_lock<std::mutex>& lock) {
+    state_ = NodeState::CANDIDATE;
+    current_term_++;
+    voted_for_ = id_;
+    int term     = current_term_;
+    int votes    = 1;
+    int majority = (peer_addresses_.size() / 2) + 1;
+
+    std::cout << "Node " << id_ << " starting election for term " << term << "\n";
+
+    raft::RequestVoteRequest req;
+    req.set_term(term);
+    req.set_candidate_id(id_);
+    req.set_last_log_index(0);
+    req.set_last_log_term(0);
+
+    lock.unlock();
+
+    std::mutex votes_mu;
+    std::vector<std::thread> vote_threads;
+
+    for (int i = 0; i < (int)peer_stubs_.size(); i++) {
+        if (i == id_) continue;
+
+        vote_threads.emplace_back([&, i]() {
+            raft::RequestVoteResponse resp;
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + 50ms);
+
+            auto status = peer_stubs_[i]->RequestVote(&ctx, req, &resp);
+            if (!status.ok()) return;
+
+            std::lock_guard<std::mutex> lk(mu_);
+
+            if (resp.term() > current_term_) {
+                becomeFollower(resp.term());
+                return;
+            }
+
+            if (state_ != NodeState::CANDIDATE || current_term_ != term) return;
+
+            if (resp.vote_granted()) {
+                std::lock_guard<std::mutex> vlk(votes_mu);
+                votes++;
+                if (votes >= majority) {
+                    becomeLeader();
+                }
+            }
+        });
+    }
+
+    for (auto& t : vote_threads) t.join();
+
+    lock.lock();
+}
+
+void RaftNode::runHeartbeat() {
+    while (running_) {
+        std::unique_lock<std::mutex> lock(mu_);
+
+        cv_.wait(lock, [this] {
+            return !running_ || state_ == NodeState::LEADER;
+        });
+
+        if (!running_) break;
+
+        raft::AppendEntriesRequest req;
+        req.set_term(current_term_);
+        req.set_leader_id(id_);
+        req.set_prev_log_index(0);
+        req.set_prev_log_term(0);
+        req.set_leader_commit(0);
+
+        lock.unlock();
+
+        for (int i = 0; i < (int)peer_stubs_.size(); i++) {
+            if (i == id_) continue;
+
+            std::thread([&, i]() {
+                raft::AppendEntriesResponse resp;
+                grpc::ClientContext ctx;
+                ctx.set_deadline(std::chrono::system_clock::now() + 30ms);
+                peer_stubs_[i]->AppendEntries(&ctx, req, &resp);
+
+                std::lock_guard<std::mutex> lk(mu_);
+                if (resp.term() > current_term_) {
+                    becomeFollower(resp.term());
+                }
+            }).detach();
+        }
+
+        std::this_thread::sleep_for(50ms);
+
+        lock.lock();
+    }
+}
+
+grpc::Status RaftNode::RequestVote(
+    grpc::ServerContext* context,
+    const raft::RequestVoteRequest* request,
+    raft::RequestVoteResponse* response)
+{
+    std::lock_guard<std::mutex> lock(mu_);
+
+    if (request->term() > current_term_) {
+        becomeFollower(request->term());
+    }
+
+    response->set_term(current_term_);
+
+    if (request->term() < current_term_) {
+        response->set_vote_granted(false);
+        return grpc::Status::OK;
+    }
+
+    bool can_vote = (voted_for_ == -1 || voted_for_ == request->candidate_id());
+    bool log_ok = isMoreUpToDate(request->last_log_index(), request->last_log_term());
+
+    if (can_vote && log_ok) {
+        voted_for_ = request->candidate_id();
+        response->set_vote_granted(true);
+        resetElectionTimer();
+        std::cout << "Node " << id_ << " voting for " << request->candidate_id()
+                  << " in term " << current_term_ << "\n";
+    } else {
+        response->set_vote_granted(false);
+    }
+
+    return grpc::Status::OK;
+}
+
+grpc::Status RaftNode::AppendEntries(
+    grpc::ServerContext* context,
+    const raft::AppendEntriesRequest* request,
+    raft::AppendEntriesResponse* response)
+{
+    std::lock_guard<std::mutex> lock(mu_);
+
+    if (request->term() > current_term_) {
+        becomeFollower(request->term());
+    }
+
+    response->set_term(current_term_);
+
+    if (request->term() < current_term_) {
+        response->set_success(false);
+        return grpc::Status::OK;
+    }
+
+    leader_id_ = request->leader_id();
+    resetElectionTimer();
+    response->set_success(true);
+
+    return grpc::Status::OK;
 }
