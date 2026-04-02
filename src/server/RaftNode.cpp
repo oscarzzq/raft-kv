@@ -41,7 +41,7 @@ void RaftNode::start() {
     builder.RegisterService(static_cast<raft::RaftService::Service*>(this));
     builder.RegisterService(static_cast<raft::KVService::Service*>(this));
     grpc_server_ = builder.BuildAndStart();
-    std::cout << "Node " << id_ << " listening on " << address << "\n";
+    std::cout << "Node " << id_ << " listening on " << address << std::endl;
 
     election_thread_  = std::thread(&RaftNode::runElectionTimer, this);
     heartbeat_thread_ = std::thread(&RaftNode::runHeartbeat, this);
@@ -61,7 +61,7 @@ std::tuple<int, int, bool> RaftNode::submitCommand(const std::string& command) {
     int index = lastLogIndex();
 
     std::cout << "Node " << id_ << " appended entry at index "
-              << index << ": " << command << "\n";
+              << index << ": " << command << std::endl;
 
     return {index, current_term_, true};
 }
@@ -78,7 +78,7 @@ void RaftNode::resetElectionTimer() {
 }
 
 void RaftNode::becomeFollower(int term) {
-    std::cout << "Node " << id_ << " becoming FOLLOWER (term " << term << ")\n";
+    std::cout << "Node " << id_ << " becoming FOLLOWER (term " << term << ")" << std::endl;
     state_        = NodeState::FOLLOWER;
     current_term_ = term;
     voted_for_    = -1;
@@ -87,7 +87,7 @@ void RaftNode::becomeFollower(int term) {
 
 void RaftNode::becomeLeader() {
     std::cout << "Node " << id_ << " becoming LEADER (term "
-              << current_term_ << ")\n";
+              << current_term_ << ")" << std::endl;
     state_     = NodeState::LEADER;
     leader_id_ = id_;
 
@@ -127,7 +127,7 @@ void RaftNode::advanceCommitIndex() {
         if (count >= majority) {
             commit_index_ = idx;
             std::cout << "Node " << id_ << " committed up to index "
-                      << commit_index_ << "\n";
+                      << commit_index_ << std::endl;
             commit_cv_.notify_all();
             break;
         }
@@ -152,10 +152,10 @@ void RaftNode::applyToStateMachine(const std::string& command) {
     if (op == "PUT") {
         ss >> value;
         kv_.put(key, value);
-        std::cout << "Node " << id_ << " applied PUT " << key << "=" << value << "\n";
+        std::cout << "Node " << id_ << " applied PUT " << key << "=" << value << std::endl;
     } else if (op == "DEL") {
         kv_.del(key);
-        std::cout << "Node " << id_ << " applied DEL " << key << "\n";
+        std::cout << "Node " << id_ << " applied DEL " << key << std::endl;
     }
 }
 
@@ -185,7 +185,7 @@ void RaftNode::startElection(std::unique_lock<std::mutex>& lock) {
     int votes     = 1;
     int majority  = (peer_addresses_.size() / 2) + 1;
 
-    std::cout << "Node " << id_ << " starting election for term " << term << "\n";
+    std::cout << "Node " << id_ << " starting election for term " << term << std::endl;
 
     raft::RequestVoteRequest req;
     req.set_term(term);
@@ -332,7 +332,7 @@ grpc::Status RaftNode::RequestVote(
         response->set_vote_granted(true);
         resetElectionTimer();
         std::cout << "Node " << id_ << " voting for "
-                  << request->candidate_id() << " in term " << current_term_ << "\n";
+                  << request->candidate_id() << " in term " << current_term_ << std::endl;
     } else {
         response->set_vote_granted(false);
     }
