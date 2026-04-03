@@ -66,7 +66,7 @@ private:
     int snapshot_last_index_ = 0;
     int snapshot_last_term_  = 0;
 
-    static constexpr int SNAPSHOT_THRESHOLD = 1;
+    static constexpr int SNAPSHOT_THRESHOLD = 100;
 
     std::vector<int> next_index_;
     std::vector<int> match_index_;
