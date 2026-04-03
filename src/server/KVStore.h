@@ -1,10 +1,8 @@
-//
-// Created by Oscar Zhang on 2026/4/2.
-//
 #pragma once
 #include <string>
 #include <unordered_map>
 #include <optional>
+#include <sstream>
 
 class KVStore {
 public:
@@ -20,6 +18,26 @@ public:
 
     bool del(const std::string& key) {
         return store_.erase(key) > 0;
+    }
+
+    std::string serialize() const {
+        std::string out;
+        for (const auto& [k, v] : store_) {
+            out += k + "\t" + v + "\n";
+        }
+        return out;
+    }
+
+    void deserialize(const std::string& data) {
+        store_.clear();
+        std::istringstream ss(data);
+        std::string line;
+        while (std::getline(ss, line)) {
+            auto sep = line.find('\t');
+            if (sep != std::string::npos) {
+                store_[line.substr(0, sep)] = line.substr(sep + 1);
+            }
+        }
     }
 
 private:

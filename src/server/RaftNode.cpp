@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <grpcpp/grpcpp.h>
 #include <sstream>
+#include <fstream>
 
 using namespace std::chrono_literals;
 
@@ -17,11 +18,16 @@ RaftNode::RaftNode(int id, std::vector<std::string> peer_addresses)
     , running_(true)
     , peer_addresses_(peer_addresses)
 {
-    log_.push_back({0, ""});
 
     for (const auto& addr : peer_addresses_) {
         auto channel = grpc::CreateChannel(addr, grpc::InsecureChannelCredentials());
         peer_stubs_.push_back(raft::RaftService::NewStub(channel));
+    }
+
+    loadSnapshot();
+
+    if (log_.empty()) {
+        log_.push_back({0, ""});
     }
 }
 
@@ -117,7 +123,8 @@ void RaftNode::advanceCommitIndex() {
     int majority = n / 2 + 1;
 
     for (int idx = lastLogIndex(); idx > commit_index_; idx--) {
-        if (log_[idx].term != current_term_) continue;
+        if (idx <= snapshot_last_index_) break;
+        if (log_[idx - snapshot_last_index_].term != current_term_) continue;
 
         int count = 0;
         for (int i = 0; i < n; i++) {
@@ -137,9 +144,9 @@ void RaftNode::advanceCommitIndex() {
 void RaftNode::applyEntries() {
     while (last_applied_ < commit_index_) {
         last_applied_++;
-        auto& entry = log_[last_applied_];
-        applyToStateMachine(entry.command);
+        applyToStateMachine(log_[last_applied_ - snapshot_last_index_].command);
     }
+    maybeSnapshot();
 }
 
 void RaftNode::applyToStateMachine(const std::string& command) {
@@ -256,9 +263,16 @@ void RaftNode::sendAppendEntries(int peer_id) {
 
     if (state_ != NodeState::LEADER) return;
 
-    int next  = next_index_[peer_id];
+    int next = next_index_[peer_id];
+
+    if (next <= snapshot_last_index_) {
+        lock.unlock();
+        sendSnapshot(peer_id);
+        return;
+    }
+
     int prev_log_index = next - 1;
-    int prev_log_term  = (prev_log_index > 0) ? log_[prev_log_index].term : 0;
+    int prev_log_term  = (prev_log_index > 0) ? logTerm(prev_log_index) : 0;
 
     raft::AppendEntriesRequest req;
     req.set_term(current_term_);
@@ -269,8 +283,8 @@ void RaftNode::sendAppendEntries(int peer_id) {
 
     for (int i = next; i <= lastLogIndex(); i++) {
         auto* e = req.add_entries();
-        e->set_term(log_[i].term);
-        e->set_command(log_[i].command);
+        e->set_term(log_[i - snapshot_last_index_].term);
+        e->set_command(log_[i - snapshot_last_index_].command);
     }
 
     lock.unlock();
@@ -300,7 +314,7 @@ void RaftNode::sendAppendEntries(int peer_id) {
         advanceCommitIndex();
         applyEntries();
     } else {
-        if (next_index_[peer_id] > 1) {
+        if (next_index_[peer_id] > snapshot_last_index_ + 1) {
             next_index_[peer_id]--;
         }
     }
@@ -364,17 +378,27 @@ grpc::Status RaftNode::AppendEntries(
     int prev_index = request->prev_log_index();
     int prev_term  = request->prev_log_term();
 
-    if (prev_index > lastLogIndex() ||
-        (prev_index > 0 && log_[prev_index].term != prev_term)) {
+    if (prev_index < snapshot_last_index_) {
+        response->set_success(false);
+        return grpc::Status::OK;
+    }
+
+    if (prev_index > lastLogIndex()) {
+        response->set_success(false);
+        return grpc::Status::OK;
+    }
+
+    if (logTerm(prev_index) != prev_term) {
         response->set_success(false);
         return grpc::Status::OK;
     }
 
     int idx = prev_index + 1;
     for (const auto& entry : request->entries()) {
-        if (idx <= lastLogIndex()) {
-            if (log_[idx].term != entry.term()) {
-                log_.erase(log_.begin() + idx, log_.end());
+        int arr_idx = idx - snapshot_last_index_;
+        if (arr_idx > 0 && arr_idx < (int)log_.size()) {
+            if (log_[arr_idx].term != entry.term()) {
+                log_.erase(log_.begin() + arr_idx, log_.end());
             } else {
                 idx++;
                 continue;
@@ -440,8 +464,135 @@ grpc::Status RaftNode::Execute(
         response->set_success(true);
     } else {
         response->set_success(false);
-        response->set_error("commit timeout or leader changed");
+        response->set_error("could not reach cluster");
     }
+
+    return grpc::Status::OK;
+}
+
+void RaftNode::maybeSnapshot() {
+    if (last_applied_ - snapshot_last_index_ < SNAPSHOT_THRESHOLD) return;
+
+    int idx  = last_applied_;
+    int term = logTerm(idx);
+    int arr_idx = idx - snapshot_last_index_;
+
+    if (arr_idx > 0 && arr_idx < (int)log_.size()) {
+        log_.erase(log_.begin(), log_.begin() + arr_idx + 1);
+        log_.insert(log_.begin(), {term, ""});
+    } else {
+        log_.clear();
+        log_.push_back({term, ""});
+    }
+
+    snapshot_last_index_ = idx;
+    snapshot_last_term_  = term;
+
+    saveSnapshot();
+}
+
+void RaftNode::saveSnapshot() {
+    std::ofstream f(snapshotPath());
+    f << snapshot_last_index_ << " " << snapshot_last_term_ << "\n";
+    f << kv_.serialize();
+}
+
+void RaftNode::loadSnapshot() {
+    std::ifstream f(snapshotPath());
+    if (!f.is_open()) return;
+
+    f >> snapshot_last_index_ >> snapshot_last_term_;
+    f.ignore();
+
+    std::string data((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+    kv_.deserialize(data);
+
+    commit_index_ = snapshot_last_index_;
+    last_applied_ = snapshot_last_index_;
+
+    log_.clear();
+    log_.push_back({snapshot_last_term_, ""});
+}
+
+void RaftNode::sendSnapshot(int peer_id) {
+    std::unique_lock<std::mutex> lock(mu_);
+
+    if (state_ != NodeState::LEADER) return;
+
+    raft::InstallSnapshotRequest req;
+    req.set_term(current_term_);
+    req.set_leader_id(id_);
+    req.set_last_included_index(snapshot_last_index_);
+    req.set_last_included_term(snapshot_last_term_);
+    req.set_data(kv_.serialize());
+
+    lock.unlock();
+
+    raft::InstallSnapshotResponse resp;
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + 5s);
+
+    auto status = peer_stubs_[peer_id]->InstallSnapshot(&ctx, req, &resp);
+    if (!status.ok()) return;
+
+    lock.lock();
+
+    if (resp.term() > current_term_) {
+        becomeFollower(resp.term());
+        return;
+    }
+
+    if (state_ != NodeState::LEADER) return;
+
+    next_index_[peer_id]  = snapshot_last_index_ + 1;
+    match_index_[peer_id] = snapshot_last_index_;
+}
+
+grpc::Status RaftNode::InstallSnapshot(
+    grpc::ServerContext* context,
+    const raft::InstallSnapshotRequest* request,
+    raft::InstallSnapshotResponse* response)
+{
+    std::lock_guard<std::mutex> lock(mu_);
+
+    if (request->term() > current_term_) {
+        becomeFollower(request->term());
+    }
+
+    response->set_term(current_term_);
+
+    if (request->term() < current_term_) {
+        return grpc::Status::OK;
+    }
+
+    resetElectionTimer();
+
+    int last_index = request->last_included_index();
+    int last_term  = request->last_included_term();
+
+    if (last_index <= commit_index_) {
+        return grpc::Status::OK;
+    }
+
+    kv_.deserialize(request->data());
+
+    int arr_idx = last_index - snapshot_last_index_;
+    if (arr_idx > 0 && arr_idx < (int)log_.size()) {
+        log_.erase(log_.begin(), log_.begin() + arr_idx + 1);
+        log_.insert(log_.begin(), {last_term, ""});
+    } else {
+        log_.clear();
+        log_.push_back({last_term, ""});
+    }
+
+    snapshot_last_index_ = last_index;
+    snapshot_last_term_  = last_term;
+    commit_index_        = last_index;
+    last_applied_        = last_index;
+
+    saveSnapshot();
+    commit_cv_.notify_all();
 
     return grpc::Status::OK;
 }

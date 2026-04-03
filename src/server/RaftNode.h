@@ -39,6 +39,12 @@ public:
         raft::AppendEntriesResponse* response
     ) override;
 
+    grpc::Status InstallSnapshot(
+        grpc::ServerContext* context,
+        const raft::InstallSnapshotRequest* request,
+        raft::InstallSnapshotResponse* response
+    ) override;
+
     grpc::Status Execute(
         grpc::ServerContext* context,
         const raft::KVRequest* request,
@@ -56,6 +62,11 @@ private:
     std::vector<LogEntry> log_;
     int commit_index_ = 0;
     int last_applied_ = 0;
+
+    int snapshot_last_index_ = 0;
+    int snapshot_last_term_  = 0;
+
+    static constexpr int SNAPSHOT_THRESHOLD = 1;
 
     std::vector<int> next_index_;
     std::vector<int> match_index_;
@@ -78,10 +89,14 @@ private:
     void startElection(std::unique_lock<std::mutex>& lock);
     void runHeartbeat();
     void sendAppendEntries(int peer_id);
+    void sendSnapshot(int peer_id);
     void resetElectionTimer();
     void advanceCommitIndex();
     void applyEntries();
     void applyToStateMachine(const std::string& command);
+    void maybeSnapshot();
+    void saveSnapshot();
+    void loadSnapshot();
     void printLog();
 
     int  getRandomTimeout();
@@ -89,6 +104,14 @@ private:
     void becomeFollower(int term);
     void becomeLeader();
 
-    int lastLogIndex() { return (int)log_.size() - 1; }
-    int lastLogTerm()  { return log_.empty() ? 0 : log_.back().term; }
+    std::string snapshotPath() const {
+        return "/tmp/raft_snapshot_" + std::to_string(id_) + ".dat";
+    }
+
+    int lastLogIndex() { return snapshot_last_index_ + (int)log_.size() - 1; }
+    int lastLogTerm()  { return log_.size() > 1 ? log_.back().term : snapshot_last_term_; }
+    int logTerm(int index) {
+        if (index == snapshot_last_index_) return snapshot_last_term_;
+        return log_[index - snapshot_last_index_].term;
+    }
 };
